@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oprindo"
+version = "0.1.0"
+description = "Oprindo SDK - C2PA signing identity and implementation evidence for generative-AI providers. Content-local by default."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Hamsa Software Ltd" }]
+requires-python = ">=3.10"
+# ZERO required dependencies — stdlib only. Local embedding uses the
+# optional c2pa extra; everything else works without it.
+dependencies = []
+
+[project.optional-dependencies]
+c2pa = ["c2pa-python>=0.6"]
+
+[project.urls]
+Homepage = "https://oprindo.com"
+Repository = "https://github.com/hexrift/oprindo-sdk-py"
+Documentation = "https://oprindo.com/guide"
+
+[tool.setuptools.packages.find]
+where = ["src"]

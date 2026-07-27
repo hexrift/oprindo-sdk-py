@@ -1,0 +1,26 @@
+name: publish
+# Tag v* to publish to PyPI via trusted publishing (configure on pypi.org:
+# project oprindo, owner hexrift, repo oprindo-sdk-py, workflow publish.yml,
+# environment production).
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write # PyPI trusted publishing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover -s tests
+      - run: |
+          python -m pip install --quiet build
+          python -m build
+      - uses: pypa/gh-action-pypi-publish@release/v1
