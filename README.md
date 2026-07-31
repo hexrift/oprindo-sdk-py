@@ -39,13 +39,58 @@ print(result.trust_state, result.evidence_id)
 Every signature carries an explicit trust state (`sandbox`, `pre_conformance`, or
 `trusted`) — never blurred. Test-key signatures carry a visible sandbox marker.
 
+### Provenance actions
+
+Omit `actions` and the SDK inspects the asset and picks the correct inception
+action:
+
+| Input | Action asserted |
+| --- | --- |
+| No prior manifest | `c2pa.created` + `digitalSourceType: trainedAlgorithmicMedia` |
+| Already carries provenance | `c2pa.opened`, with the prior manifest referenced as a `parentOf` ingredient |
+
+This matters for conformance. C2PA requires the inception action to reflect
+origin: asserting `c2pa.created` over content that arrived with a manifest
+claims an origin you cannot vouch for. Accordingly:
+
+- `c2pa.created` on an asset that already carries provenance is **refused**.
+- `c2pa.opened` must not carry a `digitalSourceType` — the origin of content you
+  opened is the parent manifest's to state — and is refused if there is nothing
+  to open.
+- An asset whose existing provenance cannot be read is **refused rather than
+  marked**, because "unreadable" is not "absent".
+
 ## Verify
 
 ```python
 report = client.verify(asset_bytes, "image/jpeg")
 ```
 
-Local when the `c2pa` extra is installed; hosted otherwise.
+Local when the `c2pa` extra is installed; hosted otherwise. The C2PA
+Conformance Program CA and TSA trust lists ship with the package and are loaded
+on the local path, so a credential chaining to a listed root reads as trusted
+and certificate validity is judged at the trusted timestamp rather than at
+"now".
+
+## Conformance
+
+Output conforms to the requirements the C2PA Conformance Program assessed
+Oprindo against (record `019fa058-c512-7f87-a214-4d8cfbda73ce`, Generator
+Product, Assurance Level 1):
+
+- every assertion in the claim's `created_assertions`, with `gathered_assertions`
+  empty;
+- the actions assertion **first** in `created_assertions`;
+- CA and TSA trust lists loaded on the validation and ingredient-ingestion paths;
+- an inception action that reflects origin.
+
+The second is not reachable through c2pa-rs configuration — it assembles claims
+in a fixed order that never puts actions first when a claim thumbnail or
+ingredient is present. The SDK therefore permutes the claim *inside the bytes
+handed to the signer*, so the signature covers the permuted claim, then rewrites
+the manifest store to match. The permutation moves raw CBOR byte slices, so the
+claim keeps its exact length and JUMBF box lengths stay valid. See
+`oprindo/_claim_order.py`.
 
 ## Evidence
 
