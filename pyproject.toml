@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oprindo"
-version = "0.1.0"
+version = "1.0.0"
 description = "Oprindo SDK - C2PA signing identity and implementation evidence for generative-AI providers. Content-local by default."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -15,7 +15,11 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-c2pa = ["c2pa-python>=0.6"]
+# PINNED, not floating. This is the component that parses untrusted media and
+# builds the claim, and claim assembly order — which the conformance fixes
+# depend on — is version-specific behaviour. Upgrades are deliberate events
+# that re-run the conformance suite.
+c2pa = ["c2pa-python>=0.37.2,<0.38"]
 
 [project.urls]
 Homepage = "https://oprindo.com"
@@ -24,3 +28,8 @@ Documentation = "https://oprindo.com/guide"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The vendored C2PA trust lists ship with the package: every trust verdict the
+# SDK reports is derived from them, so they must travel with the code.
+[tool.setuptools.package-data]
+oprindo = ["trust/*.pem"]

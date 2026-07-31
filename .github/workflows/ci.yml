@@ -3,7 +3,8 @@ on:
   push:
   pull_request:
 jobs:
-  test:
+  # The SDK's core is stdlib-only; this proves it stays that way.
+  stdlib:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -11,3 +12,15 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m unittest discover -s tests
+
+  # Conformance tests need the native c2pa wheel and a real signature, so they
+  # skip in the job above. Without this job they would skip everywhere.
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ".[c2pa]" cryptography
+      - run: python -m unittest discover -s tests -v

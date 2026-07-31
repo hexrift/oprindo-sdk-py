@@ -22,14 +22,94 @@ from typing import Any, Optional
 
 from ._der import ecdsa_der_to_raw
 
+TRAINED_ALGORITHMIC_MEDIA = (
+    "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"
+)
+
 DEFAULT_ACTIONS = [
-    {
-        "action": "c2pa.created",
-        "digitalSourceType": "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia",
-    }
+    {"action": "c2pa.created", "digitalSourceType": TRAINED_ALGORITHMIC_MEDIA}
 ]
 
 _SANDBOX_MARKER = "oprindo-sandbox"
+
+#: Instance id given to the parent ingredient, so the inception action can name
+#: what it opened. Any stable value works; it only has to match on both sides.
+PARENT_INGREDIENT_ID = "xmp:iid:oprindo-parent-ingredient"
+
+
+def _default_actions(has_prior_manifest: bool) -> list[dict[str, Any]]:
+    """The inception action for an asset, chosen by what the asset actually is.
+
+    C2PA requires the inception action to reflect origin: ``c2pa.created`` only
+    when the asset originates here, ``c2pa.opened`` when it arrived with prior
+    provenance. Asserting creation over ingested content claims an origin the
+    signer cannot vouch for — and ``c2pa.opened`` carries no digitalSourceType
+    for the same reason.
+    """
+    if has_prior_manifest:
+        return [{"action": "c2pa.opened"}]
+    return [{"action": "c2pa.created", "digitalSourceType": TRAINED_ALGORITHMIC_MEDIA}]
+
+
+def _resolve_actions(
+    actions: list[dict[str, Any]], has_prior_manifest: bool
+) -> list[dict[str, Any]]:
+    """Validate actions against what the asset is, and link ``c2pa.opened`` to
+    the ingredient it opened.
+
+    The link is mandatory: "Any c2pa.opened or c2pa.placed action must have an
+    associated ingredient identified by the ingredientIds parameter field."
+    Without it c2pa-rs raises ``assertion.action.ingredientMismatch`` and the
+    whole asset reads Invalid — an unlinked ``c2pa.opened`` is worse than the
+    wrong-action problem it fixes.
+    """
+    resolved: list[dict[str, Any]] = []
+    for action in actions:
+        name = action.get("action")
+        if name == "c2pa.created" and has_prior_manifest:
+            raise OprindoError(
+                "action_not_permitted",
+                0,
+                "this asset already carries a C2PA manifest, so it was not created "
+                "here — use c2pa.opened, or omit `actions` and the SDK will choose "
+                "correctly",
+            )
+        if name != "c2pa.opened":
+            resolved.append(action)
+            continue
+        if action.get("digitalSourceType") is not None:
+            raise OprindoError(
+                "action_not_permitted",
+                0,
+                "c2pa.opened must not assert a digitalSourceType — the origin of "
+                "content you opened is the parent manifest's to state",
+            )
+        if not has_prior_manifest:
+            raise OprindoError(
+                "action_not_permitted",
+                0,
+                "c2pa.opened requested but this asset carries no prior manifest to open",
+            )
+        resolved.append({**action, "parameters": {"ingredientIds": [PARENT_INGREDIENT_ID]}})
+    return resolved
+
+
+def _has_manifest(c2pa: Any, asset: bytes, mime_type: str, ctx: Any) -> bool:
+    """Whether the asset already carries a readable C2PA manifest.
+
+    "No manifest" and "unreadable manifest" are different answers and must stay
+    different: the first is the ordinary case for content created here, the
+    second means the asset's origin cannot be established. Only the first is
+    reported as False — anything else propagates so the caller can refuse.
+    """
+    import io
+
+    try:
+        with c2pa.Reader(mime_type, io.BytesIO(asset), context=ctx) as reader:
+            data = json.loads(reader.json())
+    except c2pa.C2paError.ManifestNotFound:
+        return False
+    return bool(data.get("active_manifest"))
 
 
 class OprindoError(Exception):
@@ -99,7 +179,6 @@ class Oprindo:
         Content-local when the ``c2pa`` extra is installed. Otherwise raises
         unless ``allow_full_service=True`` (asset bytes are then transmitted).
         """
-        actions = actions or DEFAULT_ACTIONS
         gen = dict(generator)
         if self.api_key.startswith("opr_test_") and _SANDBOX_MARKER not in gen.get("name", "").lower():
             gen["name"] = f"{gen['name']} ({_SANDBOX_MARKER})"
@@ -111,6 +190,14 @@ class Oprindo:
 
         if c2pa is not None:
             return self._mark_local(c2pa, asset, mime_type, gen, actions, title)
+        if actions is not None:
+            # Only the local path inspects the asset, so only it can tell
+            # whether the requested action reflects the asset's origin.
+            raise OprindoError(
+                "content_local_unavailable",
+                0,
+                "explicit actions require content-local marking; install oprindo[c2pa]",
+            )
         if not allow_full_service:
             raise OprindoError(
                 "content_local_unavailable",
@@ -126,29 +213,85 @@ class Oprindo:
         asset: bytes,
         mime_type: str,
         generator: dict[str, str],
-        actions: list[dict[str, str]],
+        actions: list[dict[str, Any]] | None,
         title: str | None,
     ) -> MarkResult:
+        import io
+
+        from ._claim_order import with_actions_assertion_first
+        from ._cbor import cose_payload_span
+        from ._manifest_store import (
+            manifest_store_fragments,
+            read_manifest_store,
+            replace_in_store,
+            write_manifest_store,
+        )
+        from ._settings import builder_settings, reader_settings
+
         status, info = self._json("GET", "/v1/signing-info", auth=False)
         if status != 200:
             raise OprindoError("signing_info_unavailable", status)
-        cert_chain = "\n".join(info["cert_chain"]).encode()
+        cert_chain = "\n".join(info["cert_chain"])
         asset_sha256 = hashlib.sha256(asset).hexdigest()
+
+        # Whether the input already carries provenance decides both that a
+        # parentOf ingredient is added and that c2pa.opened can name it, so it
+        # is settled once, up front, and both follow from the same answer.
+        #
+        # This read must not FAIL OPEN. An unreadable manifest is not the same
+        # as no manifest, and treating it as one would assert c2pa.created over
+        # content that arrived with provenance — the precise overreach the
+        # inception-action rule exists to prevent, reintroduced through an error
+        # path. Refuse instead.
+        try:
+            with c2pa.Context.from_dict(reader_settings()) as ctx:
+                has_prior_manifest = _has_manifest(c2pa, asset, mime_type, ctx)
+        except OprindoError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — any read failure is a refusal
+            raise OprindoError(
+                "asset_unreadable",
+                0,
+                "this asset carries provenance that could not be read, so its origin "
+                f"cannot be established and it will not be marked: {exc}",
+            ) from exc
+
+        resolved = _resolve_actions(
+            actions if actions is not None else _default_actions(has_prior_manifest),
+            has_prior_manifest,
+        )
+
         state: dict[str, Any] = {}
+        captured: dict[str, bytes] = {}
 
         def sign_callback(data: bytes) -> bytes:
-            claim = {
+            """Permute the claim inside the bytes about to be signed, then sign.
+
+            ``data`` is the COSE ``Sig_structure`` whose payload IS the claim.
+            Permuting it here — rather than re-signing afterwards as the
+            TypeScript SDK must — means the signature and any timestamp cover
+            the permuted claim directly, so only the store needs rewriting.
+            """
+            payload = cose_payload_span(data)
+            claim = data[payload.start : payload.end]
+            reordered = with_actions_assertion_first(claim)
+            if reordered is not None:
+                captured["claim"] = claim
+                captured["reordered"] = reordered
+                data = data[: payload.start] + reordered + data[payload.end :]
+
+            request_claim: dict[str, Any] = {
                 "claim_version": 1,
                 "instance_id": f"xmp:iid:{uuid.uuid4()}",
                 "format": mime_type,
                 "claim_generator_info": generator,
-                "assertions": [{"label": "c2pa.actions", "data": {"actions": actions}}],
+                "assertions": [{"label": "c2pa.actions", "data": {"actions": resolved}}],
                 "asset_sha256": asset_sha256,
                 "claim_sha256": hashlib.sha256(data).hexdigest(),
             }
             if title:
-                claim["title"] = title
-            s, resp = self._json("POST", "/v1/sign-claim", {"claim": claim})
+                request_claim["title"] = title
+            s, resp = self._json("POST", "/v1/sign-claim", {"claim": request_claim})
             if s != 200:
                 raise OprindoError(resp.get("error", "signing_failed"), s)
             state["trust_state"] = resp["trust_state"]
@@ -156,21 +299,54 @@ class Oprindo:
             # Digest path returns a DER ECDSA signature; COSE needs raw r||s.
             return ecdsa_der_to_raw(b64decode(resp["signature"]))
 
-        signer = c2pa.create_signer(sign_callback, c2pa.SigningAlg.ES256, cert_chain, None)
-        manifest = {
-            "claim_generator": f"{generator['name']}/{generator['version']}",
+        manifest: dict[str, Any] = {
+            "claim_generator_info": [
+                {"name": generator["name"], "version": generator["version"]}
+            ],
             "format": mime_type,
-            "assertions": [{"label": "c2pa.actions", "data": {"actions": actions}}],
+            "assertions": [{"label": "c2pa.actions", "data": {"actions": resolved}}],
         }
         if title:
             manifest["title"] = title
-        builder = c2pa.Builder(json.dumps(manifest))
-        import io
 
         out = io.BytesIO()
-        builder.sign(signer, mime_type, io.BytesIO(asset), out)
+        with c2pa.Context.from_dict(builder_settings()) as ctx:
+            with c2pa.Signer.from_callback(
+                sign_callback, c2pa.C2paSigningAlg.ES256, cert_chain, None
+            ) as signer:
+                builder = c2pa.Builder.from_json(json.dumps(manifest), ctx)
+                if has_prior_manifest:
+                    # Reference the prior manifest as an ingredient rather than
+                    # silently orphaning it — the builder's default drops it.
+                    builder.add_ingredient(
+                        json.dumps(
+                            {
+                                "title": "source asset",
+                                "relationship": "parentOf",
+                                "instance_id": PARENT_INGREDIENT_ID,
+                            }
+                        ),
+                        mime_type,
+                        io.BytesIO(asset),
+                    )
+                builder.sign(signer, mime_type, io.BytesIO(asset), out)
+
+        signed = out.getvalue()
+        if "reordered" in captured:
+            # The signature already covers the permuted claim; the store still
+            # holds the original, so swap it. Length-preserving, so JUMBF box
+            # lengths, segment lengths and the hard binding all stay valid.
+            fragments = manifest_store_fragments(signed, mime_type)
+            if not fragments:
+                raise OprindoError(
+                    "signing_failed", 502, "no manifest store in the signed asset"
+                )
+            store = read_manifest_store(signed, fragments)
+            store = replace_in_store(store, captured["claim"], captured["reordered"])
+            signed = write_manifest_store(signed, fragments, store, mime_type)
+
         return MarkResult(
-            asset=out.getvalue(),
+            asset=signed,
             mime_type=mime_type,
             trust_state=state.get("trust_state", "unknown"),
             evidence_id=state.get("evidence_id"),
