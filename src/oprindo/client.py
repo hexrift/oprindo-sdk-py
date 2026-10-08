@@ -16,11 +16,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from base64 import b64decode
+from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from ._der import ecdsa_der_to_raw
 
 TRAINED_ALGORITHMIC_MEDIA = (
     "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"
@@ -217,6 +216,7 @@ class Oprindo:
         title: str | None,
     ) -> MarkResult:
         import io
+        import secrets
 
         from ._claim_order import with_actions_assertion_first
         from ._cbor import cose_payload_span
@@ -224,6 +224,7 @@ class Oprindo:
             manifest_store_fragments,
             read_manifest_store,
             replace_in_store,
+            signature_placeholder_span,
             write_manifest_store,
         )
         from ._settings import builder_settings, reader_settings
@@ -261,43 +262,16 @@ class Oprindo:
             has_prior_manifest,
         )
 
-        state: dict[str, Any] = {}
         captured: dict[str, bytes] = {}
+        placeholder = secrets.token_bytes(64)
 
         def sign_callback(data: bytes) -> bytes:
-            """Permute the claim inside the bytes about to be signed, then sign.
-
-            ``data`` is the COSE ``Sig_structure`` whose payload IS the claim.
-            Permuting it here — rather than re-signing afterwards as the
-            TypeScript SDK must — means the signature and any timestamp cover
-            the permuted claim directly, so only the store needs rewriting.
-            """
+            # The native binding accepts a raw ECDSA signature, not broker COSE.
+            # Build a temporary manifest locally; replace its complete signature
+            # box after asking the broker to inspect and sign the actual claim.
             payload = cose_payload_span(data)
-            claim = data[payload.start : payload.end]
-            reordered = with_actions_assertion_first(claim)
-            if reordered is not None:
-                captured["claim"] = claim
-                captured["reordered"] = reordered
-                data = data[: payload.start] + reordered + data[payload.end :]
-
-            request_claim: dict[str, Any] = {
-                "claim_version": 1,
-                "instance_id": f"xmp:iid:{uuid.uuid4()}",
-                "format": mime_type,
-                "claim_generator_info": generator,
-                "assertions": [{"label": "c2pa.actions", "data": {"actions": resolved}}],
-                "asset_sha256": asset_sha256,
-                "claim_sha256": hashlib.sha256(data).hexdigest(),
-            }
-            if title:
-                request_claim["title"] = title
-            s, resp = self._json("POST", "/v1/sign-claim", {"claim": request_claim})
-            if s != 200:
-                raise OprindoError(resp.get("error", "signing_failed"), s)
-            state["trust_state"] = resp["trust_state"]
-            state["evidence_id"] = resp.get("evidence_id")
-            # Digest path returns a DER ECDSA signature; COSE needs raw r||s.
-            return ecdsa_der_to_raw(b64decode(resp["signature"]))
+            captured["claim"] = data[payload.start : payload.end]
+            return placeholder
 
         manifest: dict[str, Any] = {
             "claim_generator_info": [
@@ -332,24 +306,63 @@ class Oprindo:
                 builder.sign(signer, mime_type, io.BytesIO(asset), out)
 
         signed = out.getvalue()
-        if "reordered" in captured:
-            # The signature already covers the permuted claim; the store still
-            # holds the original, so swap it. Length-preserving, so JUMBF box
-            # lengths, segment lengths and the hard binding all stay valid.
-            fragments = manifest_store_fragments(signed, mime_type)
-            if not fragments:
-                raise OprindoError(
-                    "signing_failed", 502, "no manifest store in the signed asset"
-                )
-            store = read_manifest_store(signed, fragments)
-            store = replace_in_store(store, captured["claim"], captured["reordered"])
-            signed = write_manifest_store(signed, fragments, store, mime_type)
+        original = captured.get("claim")
+        if original is None:
+            raise OprindoError("signing_failed", 502, "the builder did not produce a claim")
+        claim = with_actions_assertion_first(original) or original
+        fragments = manifest_store_fragments(signed, mime_type)
+        if not fragments:
+            raise OprindoError("signing_failed", 502, "no manifest store in the staged asset")
+        store = read_manifest_store(signed, fragments)
+        signature = signature_placeholder_span(store, placeholder)
+        reserve_size = signature.end - signature.start
+        request_claim: dict[str, Any] = {
+            "claim_version": 1,
+            "instance_id": f"xmp:iid:{uuid.uuid4()}",
+            "format": mime_type,
+            "claim_generator_info": generator,
+            "assertions": [{"label": "c2pa.actions", "data": {"actions": resolved}}],
+            "asset_sha256": asset_sha256,
+            "claim_sha256": hashlib.sha256(claim).hexdigest(),
+        }
+        if title:
+            request_claim["title"] = title
+        status, response = self._json("POST", "/v1/sign-claim", {
+            "claim": request_claim,
+            "claim_bytes_b64": b64encode(claim).decode("ascii"),
+            "reserve_size": reserve_size,
+        })
+        if status != 200:
+            raise OprindoError(response.get("error", "signing_failed"), status)
+        try:
+            cose = b64decode(response["cose_sign1"], validate=True)
+        except (KeyError, ValueError, TypeError) as exc:
+            raise OprindoError("signing_failed", 502, "no valid COSE signature in response") from exc
+        if len(cose) != reserve_size:
+            raise OprindoError("signing_failed", 502, "COSE signature does not fit the reserved box")
+        store = replace_in_store(store, original, claim)
+        store = store[:signature.start] + cose + store[signature.end:]
+        signed = write_manifest_store(signed, fragments, store, mime_type)
 
+        # Return only a completed, validated asset. A trusted response must
+        # include a timestamp that actually validates against the TSA trust list.
+        with c2pa.Context.from_dict(reader_settings()) as ctx:
+            with c2pa.Reader(mime_type, io.BytesIO(signed), context=ctx) as reader:
+                report = json.loads(reader.json())
+        active = report.get("validation_results", {}).get("activeManifest", {})
+        failures = {entry.get("code") for entry in active.get("failure", [])}
+        codes = {entry.get("code") for entry in active.get("success", [])}
+        if "claimSignature.validated" not in codes or failures - {"signingCredential.untrusted", "timeStamp.untrusted"}:
+            raise OprindoError("signing_failed", 502, "the completed manifest did not validate")
+        if response.get("trust_state") == "trusted":
+            required = {"signingCredential.trusted", "claimSignature.validated", "timeStamp.trusted", "timeStamp.validated"}
+            if failures or not required <= codes:
+                raise OprindoError("signing_failed", 502, "trusted signing requires a validated timestamp and credential")
         return MarkResult(
             asset=signed,
             mime_type=mime_type,
-            trust_state=state.get("trust_state", "unknown"),
-            evidence_id=state.get("evidence_id"),
+            trust_state=response.get("trust_state", "unknown"),
+            evidence_id=response.get("evidence_id"),
         )
 
     def _mark_full_service(self, asset: bytes, mime_type: str) -> MarkResult:
