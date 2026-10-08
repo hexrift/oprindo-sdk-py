@@ -89,7 +89,8 @@ def builder_settings() -> dict:
 
     ``verify_after_sign`` is off because the claim is permuted after c2pa-rs
     lays it out, so the manifest c2pa-rs would verify is not the one that ends
-    up in the asset. The signature itself is made over the permuted claim.
+    up in the asset. The placeholder signature is replaced by broker COSE over the permuted claim;
+    the completed asset is then validated separately.
     """
     settings = _trust_settings()
     settings["builder"] = {"created_assertion_labels": CREATED_ASSERTION_LABELS}

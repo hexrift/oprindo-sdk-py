@@ -161,3 +161,44 @@ def replace_in_store(store: bytes, find: bytes, replace: bytes) -> bytes:
     if store.find(find, at + 1) != -1:
         raise ManifestStoreError("sequence to replace is ambiguous (occurs more than once)")
     return store[:at] + replace + store[at + len(find) :]
+
+
+def signature_placeholder_span(store: bytes, marker: bytes) -> StoreFragment:
+    """Locate the one CBOR signature box containing our random raw signature.
+
+    Walk actual JUMBF box boundaries, including ingredient stores, rather than
+    interpreting a byte pattern inside certificate or assertion data as a box.
+    """
+    matches: list[StoreFragment] = []
+
+    def walk(start: int, end: int) -> None:
+        at = start
+        while at < end:
+            if at + 8 > end:
+                raise ManifestStoreError("truncated JUMBF box")
+            size = _u32(store, at)
+            header = 8
+            if size == 1:
+                if at + 16 > end:
+                    raise ManifestStoreError("truncated extended JUMBF box")
+                size = int.from_bytes(store[at + 8 : at + 16], "big")
+                header = 16
+            elif size == 0:
+                size = end - at
+            stop = at + size
+            if size < header or stop > end:
+                raise ManifestStoreError("invalid JUMBF box length")
+            kind = store[at + 4 : at + 8]
+            payload = at + header
+            if kind == b"jumb":
+                walk(payload, stop)
+            elif kind == b"cbor" and marker in store[payload:stop]:
+                matches.append(StoreFragment(payload, stop))
+            at = stop
+
+    if not marker or store.count(marker) != 1:
+        raise ManifestStoreError("signature placeholder is missing or ambiguous")
+    walk(0, len(store))
+    if len(matches) != 1:
+        raise ManifestStoreError("signature placeholder is not in one CBOR box")
+    return matches[0]

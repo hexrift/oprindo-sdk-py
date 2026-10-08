@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 try:
     import c2pa  # type: ignore
+    from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.hazmat.primitives.asymmetric import utils as asym_utils
@@ -151,9 +152,8 @@ def _ephemeral_chain():
 class _LocallySigning(Oprindo):
     """Signs with a development key instead of calling the service.
 
-    The broker signs whatever digest it is handed, so emulating it here
-    exercises the real code path: the SDK still permutes the claim, still
-    computes the digest over the permuted bytes, and still rewrites the store.
+    Emulates broker-owned COSE with a real signature over the supplied claim.
+    The SDK must embed the complete response and validate the resulting asset.
     """
 
     def __init__(self, *args, **kwargs):
@@ -164,14 +164,55 @@ class _LocallySigning(Oprindo):
         if path == "/v1/signing-info":
             return 200, {"cert_chain": [self._chain], "trust_state": "pre_conformance"}
         if path == "/v1/sign-claim":
-            digest = bytes.fromhex(payload["claim"]["claim_sha256"])
-            der = self._key.sign(digest, ec.ECDSA(asym_utils.Prehashed(hashes.SHA256())))
+            # Emulate the broker's complete COSE response, signing the actual
+            # supplied claim with a real ephemeral key. No raw-digest fallback.
+            claim = base64.b64decode(payload["claim_bytes_b64"], validate=True)
+            chain = [cert.public_bytes(serialization.Encoding.DER)
+                     for cert in x509.load_pem_x509_certificates(self._chain.encode())]
+            protected = _cbor({1: -7, 33: chain})
+            der = self._key.sign(_cbor(["Signature1", protected, b"", claim]), ec.ECDSA(hashes.SHA256()))
+            r, s = asym_utils.decode_dss_signature(der)
+            raw = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+            reserve = payload["reserve_size"]
+            pad = reserve - len(protected) - 100
+            for _ in range(8):
+                cose = b"\xd2" + _cbor([protected, {"pad": bytes(pad)}, None, raw])
+                if len(cose) == reserve:
+                    break
+                pad += reserve - len(cose)
+            assert len(cose) == reserve
+            self.last_payload = payload
+            self.last_cose = cose
             return 200, {
-                "signature": base64.b64encode(der).decode(),
+                "cose_sign1": base64.b64encode(cose).decode(),
                 "trust_state": "pre_conformance",
+                "timestamp_included": False,
                 "evidence_id": "00000000-0000-4000-8000-000000000000",
             }
         raise AssertionError(f"unexpected request to {path}")
+
+
+def _cbor(value):
+    """Small test-only COSE encoder; production takes broker bytes unchanged."""
+    def head(major, number):
+        if number < 24:
+            return bytes([(major << 5) | number])
+        width = 1 if number < 256 else 2 if number < 65536 else 4
+        return bytes([(major << 5) | {1: 24, 2: 25, 4: 26}[width]]) + number.to_bytes(width, "big")
+    if value is None:
+        return b"\xf6"
+    if isinstance(value, int):
+        return head(0, value) if value >= 0 else head(1, -1 - value)
+    if isinstance(value, bytes):
+        return head(2, len(value)) + value
+    if isinstance(value, str):
+        data = value.encode()
+        return head(3, len(data)) + data
+    if isinstance(value, list):
+        return head(4, len(value)) + b"".join(_cbor(item) for item in value)
+    if isinstance(value, dict):
+        return head(5, len(value)) + b"".join(_cbor(key) + _cbor(item) for key, item in value.items())
+    raise TypeError(value)
 
 
 GENERATOR = {"name": "Test Generator", "version": "1.0.0"}
@@ -184,6 +225,38 @@ class ClaimConformance(unittest.TestCase):
 
     def _mark(self, data: bytes) -> bytes:
         return self.sdk.mark(data, "image/jpeg", GENERATOR).asset
+
+    def test_embeds_the_complete_broker_cose_without_rewrapping(self):
+        for asset, mime in [(TINY_JPEG, "image/jpeg"), (_tiny_png(), "image/png")]:
+            with self.subTest(mime=mime):
+                signed = self.sdk.mark(asset, mime, GENERATOR).asset
+                store = read_manifest_store(signed, manifest_store_fragments(signed, mime))
+                self.assertIn(self.sdk.last_cose, store)
+                self.assertEqual(base64.b64decode(self.sdk.last_payload["claim_bytes_b64"]), _active_claim(signed, mime))
+                self.assertGreater(self.sdk.last_payload["reserve_size"], 10000)
+
+    def test_refuses_an_obsolete_raw_signature_response(self):
+        original = self.sdk._json
+        def obsolete(method, path, payload=None, auth=True):
+            if path == "/v1/sign-claim":
+                return 200, {"signature": "AA==", "trust_state": "trusted"}
+            return original(method, path, payload, auth)
+        self.sdk._json = obsolete
+        with self.assertRaises(OprindoError) as caught:
+            self._mark(TINY_JPEG)
+        self.assertEqual(caught.exception.code, "signing_failed")
+
+    def test_refuses_trusted_label_without_a_timestamp(self):
+        original = self.sdk._json
+        def mislabeled(method, path, payload=None, auth=True):
+            status, result = original(method, path, payload, auth)
+            if path == "/v1/sign-claim":
+                result["trust_state"] = "trusted"
+            return status, result
+        self.sdk._json = mislabeled
+        with self.assertRaises(OprindoError) as caught:
+            self._mark(TINY_JPEG)
+        self.assertEqual(caught.exception.code, "signing_failed")
 
     def test_every_assertion_is_created_and_gathered_is_empty(self):
         claim = _active_claim(self._mark(TINY_JPEG), "image/jpeg")

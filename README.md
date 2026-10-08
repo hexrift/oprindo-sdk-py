@@ -16,13 +16,14 @@ The choice is always yours and always explicit.
 ## Install
 
 ```sh
-pip install oprindo[c2pa]     # content-local marking (recommended)
+pip install "oprindo[c2pa]>=1.0.1"  # content-local marking (recommended)
 pip install oprindo           # stdlib-only: hosted verify + evidence
 ```
 
 ## Mark
 
 ```python
+import os
 from oprindo import Oprindo
 
 client = Oprindo(api_key=os.environ["OPRINDO_API_KEY"])
@@ -35,6 +36,12 @@ with open("generated.marked.jpg", "wb") as f:
 
 print(result.trust_state, result.evidence_id)
 ```
+
+Version 1.0.1 sends the actual claim to the broker and embeds its complete
+COSE signature, including the signing certificate and timestamp. The SDK
+validates the completed asset before returning it. Production rejects the
+older digest-only signing flow with `claim_bytes_required`; upgrade from 1.0.0.
+A trusted result requires both a trusted credential and a validated timestamp.
 
 Every signature carries an explicit trust state (`sandbox`, `pre_conformance`, or
 `trusted`) — never blurred. Test-key signatures carry a visible sandbox marker.
@@ -86,9 +93,9 @@ Product, Assurance Level 1):
 
 The second is not reachable through c2pa-rs configuration — it assembles claims
 in a fixed order that never puts actions first when a claim thumbnail or
-ingredient is present. The SDK therefore permutes the claim *inside the bytes
-handed to the signer*, so the signature covers the permuted claim, then rewrites
-the manifest store to match. The permutation moves raw CBOR byte slices, so the
+ingredient is present. The SDK therefore stages a local manifest, permutes the claim before sending
+it to the broker, then embeds both the permuted claim and the broker's complete
+COSE response into the manifest store. The permutation moves raw CBOR byte slices, so the
 claim keeps its exact length and JUMBF box lengths stay valid. See
 `oprindo/_claim_order.py`.
 
